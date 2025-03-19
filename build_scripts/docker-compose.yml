@@ -1,10 +1,12 @@
+version: "3.8"
+
 x-common-variables: &common-server-variables
   RUST_LOG: "debug"
   SERVER_CONFIG_FILE: "/app/server-config.toml"
   CLUSTER_CONFIG_FILE: "/app/cluster-config.toml"
-  OMNIPAXOS_NODE_ADDRS: "s1:8000,s2:8000,s3:8000" # Overwrite node_addrs in cluster config TOML
-  OMNIPAXOS_LISTEN_ADDRESS: "0.0.0.0" # Overwrite listen_address in server config TOMLs
-  OMNIPAXOS_LISTEN_PORT: 8000 # Overwrite listen_port in server config TOMLs
+  OMNIPAXOS_NODE_ADDRS: "s1:8000,s2:8000,s3:8000"
+  OMNIPAXOS_LISTEN_ADDRESS: "0.0.0.0"
+  OMNIPAXOS_LISTEN_PORT: 8000
   DATABASE_URL: "postgres://postgres:postgres@postgres:5432/omnipaxos_db"
 
 services:
@@ -69,35 +71,75 @@ services:
       postgres:
         condition: service_healthy
 
-  # Clients
-  c1:
+  # Clients for Testing Leader-based and Linearizable Reads
+  test_client_leader:
     image: omnipaxos-client
-    build:
-      context: ./..
-      dockerfile: client.dockerfile
-    container_name: c1
+    container_name: test_client_leader
     environment:
       RUST_LOG: "debug"
-      CONFIG_FILE: "/app/client-config.toml"
-      OMNIPAXOS_SERVER_ADDRESS: "s1:8000" # Overwrite server_address in client config TOML
+      CONFIG_FILE: "/app/client-test-config.toml" # Docker looks here
+      OMNIPAXOS_SERVER_ADDRESS: "s1:8000" # Adjust if needed
     volumes:
-      - ./client-1-config.toml:/app/client-config.toml
+      - "C:/Users/Abdul Rahman/Desktop/DS-Project Ours/DS-Project/build_scripts/client-test-config.toml:/app/client-test-config.toml" # Mount correctly
       - ./logs/:/app/logs/
     depends_on:
       - s1
 
-  c2:
+  test_client_linearizable:
     image: omnipaxos-client
-    container_name: c2
+    container_name: test_client_linearizable
     environment:
       RUST_LOG: "debug"
-      CONFIG_FILE: "/app/client-config.toml"
-      OMNIPAXOS_SERVER_ADDRESS: "s2:8000" # Overwrite server_address in client config TOML
+      CONFIG_FILE: "/app/client-test-config.toml"
+      OMNIPAXOS_SERVER_ADDRESS: "s1:8000"
+      TEST_MODE: "linearizable-read" # Custom env for triggering linearizable read test
     volumes:
-      - ./client-2-config.toml:/app/client-config.toml
+      - "C:/Users/Abdul Rahman/Desktop/DS-Project Ours/DS-Project/build_scripts/client-test-config.toml:/app/client-test-config.toml" # Ensure correct mounting path
       - ./logs/:/app/logs/
     depends_on:
+      - s1
+
+  # Fault Injection Service (Simulating Failure and Recovery)
+  failure_injector:
+    image: alpine
+    container_name: failure_injector
+    entrypoint: ["/bin/sh", "-c"]
+    command: >
+      echo "#!/bin/sh" > /failure_script.sh &&
+      echo "sleep 10" >> /failure_script.sh &&
+      echo "echo 'Stopping leader node (s1)...'" >> /failure_script.sh &&
+      echo "docker stop s1" >> /failure_script.sh &&
+      echo "sleep 10" >> /failure_script.sh &&
+      echo "echo 'Restarting leader node (s1)...'" >> /failure_script.sh &&
+      echo "docker start s1" >> /failure_script.sh &&
+      echo "sleep 10" >> /failure_script.sh &&
+      echo "echo 'Stopping follower node (s2)...'" >> /failure_script.sh &&
+      echo "docker stop s2" >> /failure_script.sh &&
+      echo "sleep 10" >> /failure_script.sh &&
+      echo "echo 'Restarting follower node (s2)...'" >> /failure_script.sh &&
+      echo "docker start s2" >> /failure_script.sh &&
+      echo "echo 'Failure injection complete.'" >> /failure_script.sh &&
+      chmod +x /failure_script.sh &&
+      /failure_script.sh
+    depends_on:
+      - s1
       - s2
+      - s3
+
+  # Stress Test for Concurrency Under Load
+  stress_test_client:
+    image: omnipaxos-client
+    container_name: stress_test_client
+    environment:
+      RUST_LOG: "debug"
+      CONFIG_FILE: "/app/client-test-config.toml" # This must match the mounted file name
+      OMNIPAXOS_SERVER_ADDRESS: "s1:8000"
+      TEST_MODE: "concurrent-load"
+    volumes:
+      - "C:/Users/Abdul Rahman/Desktop/DS-Project Ours/DS-Project/build_scripts/client-test-config.toml:/app/client-test-config.toml"
+      - ./logs/:/app/logs/
+    depends_on:
+      - s1
 
 volumes:
   postgres_data:
