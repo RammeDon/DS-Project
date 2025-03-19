@@ -6,6 +6,9 @@ RUN set -eux
 # Only fetch crates.io index for used crates
 ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
 
+# Install PostgreSQL development libraries
+RUN apt-get update && apt-get install -y libpq-dev
+
 # cargo-chef will be cached from the second build onwards
 RUN cargo install cargo-chef
 WORKDIR /app
@@ -25,6 +28,10 @@ RUN cargo build --release --bin server
 
 FROM debian:bookworm-slim AS runtime
 WORKDIR /app
+
+# Install only the PostgreSQL client runtime libraries
+RUN apt-get update && apt-get install -y libpq5 ca-certificates && rm -rf /var/lib/apt/lists/*
+
 COPY --from=builder /app/target/release/server /usr/local/bin
 EXPOSE 8000
 ENTRYPOINT ["/usr/local/bin/server"]

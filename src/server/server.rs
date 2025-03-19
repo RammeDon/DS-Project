@@ -1,4 +1,4 @@
-use crate::{configs::OmniPaxosKVConfig, database::Database, network::Network};
+use crate::{configs::OmniPaxosKVConfig, database::{Database, QueryResult}, network::Network};
 use chrono::Utc;
 use log::*;
 use omnipaxos::{
@@ -9,6 +9,8 @@ use omnipaxos::{
 use omnipaxos_kv::common::{kv::*, messages::*, utils::Timestamp};
 use omnipaxos_storage::memory_storage::MemoryStorage;
 use std::{fs::File, io::Write, time::Duration};
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 type OmniPaxosInstance = OmniPaxos<Command, MemoryStorage<Command>>;
 const NETWORK_BATCH_SIZE: usize = 100;
@@ -17,7 +19,7 @@ const ELECTION_TIMEOUT: Duration = Duration::from_secs(1);
 
 pub struct OmniPaxosServer {
     id: NodeId,
-    database: Database,
+    database: Arc<RwLock<Database>>,
     network: Network,
     omnipaxos: OmniPaxosInstance,
     current_decided_idx: usize,
@@ -33,11 +35,17 @@ impl OmniPaxosServer {
         let omnipaxos_config: OmniPaxosConfig = config.clone().into();
         let omnipaxos_msg_buffer = Vec::with_capacity(omnipaxos_config.server_config.buffer_size);
         let omnipaxos = omnipaxos_config.build(storage).unwrap();
+        
+        // Initialize SQL database
+        info!("Server {}: Initializing SQL database", config.local.server_id);
+        let database = Arc::new(RwLock::new(Database::new().await));
+        
         // Waits for client and server network connections to be established
         let network = Network::new(config.clone(), NETWORK_BATCH_SIZE).await;
+        
         OmniPaxosServer {
             id: config.local.server_id,
-            database: Database::new(),
+            database,
             network,
             omnipaxos,
             current_decided_idx: 0,
@@ -111,8 +119,8 @@ impl OmniPaxosServer {
         }
     }
 
-    fn handle_decided_entries(&mut self) {
-        // TODO: Can use a read_raw here to avoid allocation
+    async fn handle_decided_entries(&mut self) {
+        // Get newly decided entries
         let new_decided_idx = self.omnipaxos.get_decided_idx();
         if self.current_decided_idx < new_decided_idx {
             let decided_entries = self
@@ -121,6 +129,7 @@ impl OmniPaxosServer {
                 .unwrap();
             self.current_decided_idx = new_decided_idx;
             debug!("Decided {new_decided_idx}");
+            
             let decided_commands = decided_entries
                 .into_iter()
                 .filter_map(|e| match e {
@@ -128,20 +137,50 @@ impl OmniPaxosServer {
                     _ => unreachable!(),
                 })
                 .collect();
-            self.update_database_and_respond(decided_commands);
+            
+            // Update the database with the new commands
+            self.update_database_and_respond(decided_commands).await;
         }
     }
 
-    fn update_database_and_respond(&mut self, commands: Vec<Command>) {
-        // TODO: batching responses possible here (batch at handle_cluster_messages)
+    async fn update_database_and_respond(&mut self, commands: Vec<Command>) {
         for command in commands {
-            let read = self.database.handle_command(command.kv_cmd);
-            if command.coordinator_id == self.id {
-                let response = match read {
-                    Some(read_result) => ServerMessage::Read(command.id, read_result),
-                    None => ServerMessage::Write(command.id),
-                };
-                self.network.send_to_client(command.client_id, response);
+            let database = self.database.clone();
+            let client_id = command.client_id;
+            let command_id = command.id;
+            let coordinator_id = command.coordinator_id;
+            let kv_cmd = command.kv_cmd.clone();
+            
+            // Process each command
+            if coordinator_id == self.id {
+                // Only process commands if we're the coordinator
+                let mut db_lock = database.write().await;
+                match db_lock.handle_command(kv_cmd).await {
+                    Some(Ok(QueryResult::SingleValue(value))) => {
+                        debug!("Query result: SingleValue({:?})", value);
+                        let response = ServerMessage::Read(command_id, value);
+                        self.network.send_to_client(client_id, response);
+                    },
+                    Some(Ok(QueryResult::Rows(rows))) => {
+                        info!("Query result: {} rows", rows.len());
+                        let response = ServerMessage::QueryResult(command_id, rows);
+                        self.network.send_to_client(client_id, response);
+                    },
+                    Some(Ok(QueryResult::Success)) => {
+                        debug!("Query result: Success");
+                        let response = ServerMessage::Write(command_id);
+                        self.network.send_to_client(client_id, response);
+                    },
+                    Some(Err(error)) => {
+                        error!("Query error: {}", error);
+                        let response = ServerMessage::Error(command_id, error);
+                        self.network.send_to_client(client_id, response);
+                    },
+                    None => {
+                        let response = ServerMessage::Write(command_id);
+                        self.network.send_to_client(client_id, response);
+                    },
+                }
             }
         }
     }
@@ -160,11 +199,95 @@ impl OmniPaxosServer {
         for (from, message) in messages.drain(..) {
             match message {
                 ClientMessage::Append(command_id, kv_command) => {
+                    debug!("Received Append({}, {:?})", command_id, kv_command);
                     self.append_to_log(from, command_id, kv_command)
+                },
+                ClientMessage::Read(command_id, query, consistency) => {
+                    info!("Received Read({}, {:?}, {:?})", command_id, query, consistency);
+                    self.handle_read(from, command_id, query, consistency).await
                 }
             }
         }
         self.send_outgoing_msgs();
+    }
+
+    async fn handle_read(&mut self, from: ClientId, command_id: CommandId, query: String, consistency: ReadConsistency) {
+        match consistency {
+            ReadConsistency::Leader => {
+                // Only the leader can respond to leader reads
+                if let Some((current_leader, _)) = self.omnipaxos.get_current_leader() {
+                    if current_leader == self.id {
+                        // If I'm the leader, execute the read locally
+                        info!("Node {} handling leader read for query: {}", self.id, query);
+                        let database = self.database.clone();
+                        let db = database.read().await;
+                        match db.direct_read(&query).await {
+                            Ok(QueryResult::Rows(rows)) => {
+                                info!("Leader read result: {} rows", rows.len());
+                                self.network.send_to_client(from, ServerMessage::QueryResult(command_id, rows));
+                            },
+                            Ok(QueryResult::SingleValue(value)) => {
+                                debug!("Leader read result: {:?}", value);
+                                self.network.send_to_client(from, ServerMessage::Read(command_id, value));
+                            },
+                            Ok(QueryResult::Success) => {
+                                debug!("Leader read result: Success");
+                                self.network.send_to_client(from, ServerMessage::Write(command_id));
+                            },
+                            Err(error) => {
+                                error!("Leader read error: {}", error);
+                                self.network.send_to_client(from, ServerMessage::Error(command_id, error));
+                            },
+                        }
+                    } else {
+                        // If I'm not the leader, return an error
+                        error!("Not the leader for a leader read. Current leader is {}", current_leader);
+                        let error_response = ServerMessage::Error(
+                            command_id, 
+                            format!("Not the leader. Current leader is {}", current_leader)
+                        );
+                        self.network.send_to_client(from, error_response);
+                    }
+                } else {
+                    error!("No leader available for a leader read");
+                    let error_response = ServerMessage::Error(
+                        command_id, 
+                        "No leader available".to_string()
+                    );
+                    self.network.send_to_client(from, error_response);
+                }
+            },
+            ReadConsistency::Local => {
+                // Execute read locally regardless of leader status
+                info!("Node {} handling local read for query: {}", self.id, query);
+                let database = self.database.clone();
+                let db = database.read().await;
+                match db.direct_read(&query).await {
+                    Ok(QueryResult::Rows(rows)) => {
+                        info!("Local read result: {} rows", rows.len());
+                        self.network.send_to_client(from, ServerMessage::QueryResult(command_id, rows));
+                    },
+                    Ok(QueryResult::SingleValue(value)) => {
+                        debug!("Local read result: {:?}", value);
+                        self.network.send_to_client(from, ServerMessage::Read(command_id, value));
+                    },
+                    Ok(QueryResult::Success) => {
+                        debug!("Local read result: Success");
+                        self.network.send_to_client(from, ServerMessage::Write(command_id));
+                    },
+                    Err(error) => {
+                        error!("Local read error: {}", error);
+                        self.network.send_to_client(from, ServerMessage::Error(command_id, error));
+                    },
+                }
+            },
+            ReadConsistency::Linearizable => {
+                // For linearizable reads, we put the read through the log
+                info!("Node {} handling linearizable read for query: {}", self.id, query);
+                let kv_command = KVCommand::QueryRead(query);
+                self.append_to_log(from, command_id, kv_command);
+            }
+        }
     }
 
     async fn handle_cluster_messages(
@@ -177,7 +300,7 @@ impl OmniPaxosServer {
             match message {
                 ClusterMessage::OmniPaxosMessage(m) => {
                     self.omnipaxos.handle_incoming(m);
-                    self.handle_decided_entries();
+                    self.handle_decided_entries().await;
                 }
                 ClusterMessage::LeaderStartSignal(start_time) => {
                     debug!("Received start message from peer {from}");
@@ -197,9 +320,10 @@ impl OmniPaxosServer {
             id: command_id,
             kv_cmd: kv_command,
         };
-        self.omnipaxos
-            .append(command)
-            .expect("Append to Omnipaxos log failed");
+        match self.omnipaxos.append(command) {
+            Ok(_) => debug!("Appended to OmniPaxos log"),
+            Err(e) => error!("Failed to append to OmniPaxos log: {:?}", e),
+        }
     }
 
     fn send_cluster_start_signals(&mut self, start_time: Timestamp) {

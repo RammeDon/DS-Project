@@ -3,7 +3,7 @@ pub mod messages {
     use serde::{Deserialize, Serialize};
 
     use super::{
-        kv::{Command, CommandId, KVCommand},
+        kv::{Command, CommandId, KVCommand, ReadConsistency},
         utils::Timestamp,
     };
 
@@ -22,13 +22,16 @@ pub mod messages {
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub enum ClientMessage {
         Append(CommandId, KVCommand),
+        Read(CommandId, String, ReadConsistency), // Added Read command with SQL query and consistency level
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
     pub enum ServerMessage {
         Write(CommandId),
         Read(CommandId, Option<String>),
+        QueryResult(CommandId, Vec<Vec<String>>), // Added for SQL query results
         StartSignal(Timestamp),
+        Error(CommandId, String), // Added for SQL errors
     }
 
     impl ServerMessage {
@@ -36,6 +39,8 @@ pub mod messages {
             match self {
                 ServerMessage::Write(id) => *id,
                 ServerMessage::Read(id, _) => *id,
+                ServerMessage::QueryResult(id, _) => *id,
+                ServerMessage::Error(id, _) => *id,
                 ServerMessage::StartSignal(_) => unimplemented!(),
             }
         }
@@ -60,11 +65,21 @@ pub mod kv {
         pub kv_cmd: KVCommand,
     }
 
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+    pub enum ReadConsistency {
+        Leader,      // Read from the leader only
+        Local,       // Read from any node (potentially stale)
+        Linearizable, // Linearizable read (through the log)
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub enum KVCommand {
         Put(String, String),
         Delete(String),
         Get(String),
+        // New SQL commands
+        ExecuteQuery(String),    // For SQL statements that modify data (INSERT, UPDATE, DELETE, CREATE, etc.)
+        QueryRead(String),       // For SQL queries that read data (SELECT)
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -89,6 +104,8 @@ pub mod kv {
                         }
                     }
                     KVCommand::Get(_) => (),
+                    KVCommand::ExecuteQuery(_) => (), // Snapshots for SQL will be implemented differently
+                    KVCommand::QueryRead(_) => (),    // Read operations don't affect state
                 }
             }
             // remove keys that were put back
@@ -159,13 +176,6 @@ pub mod utils {
         )
     }
 
-    // pub type ServerConnection = Framed<
-    //     CodecFramed<TcpStream, LengthDelimitedCodec>,
-    //     ServerMessage,
-    //     ClientMessage,
-    //     Bincode<ServerMessage, ClientMessage>,
-    // >;
-
     pub type FromServerConnection = Framed<
         FramedRead<OwnedReadHalf, LengthDelimitedCodec>,
         ServerMessage,
@@ -205,11 +215,6 @@ pub mod utils {
             ToServerConnection::new(sink, Bincode::default()),
         )
     }
-
-    // pub fn frame_clients_connection(stream: TcpStream) -> ServerConnection {
-    //     let length_delimited = CodecFramed::new(stream, LengthDelimitedCodec::new());
-    //     Framed::new(length_delimited, Bincode::default())
-    // }
 
     pub fn frame_servers_connection(
         stream: TcpStream,
