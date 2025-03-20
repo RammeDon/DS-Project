@@ -77,10 +77,10 @@ services:
     container_name: test_client_leader
     environment:
       RUST_LOG: "debug"
-      CONFIG_FILE: "/app/client-test-config.toml" # Docker looks here
-      OMNIPAXOS_SERVER_ADDRESS: "s1:8000" # Adjust if needed
+      CONFIG_FILE: "/app/client-test-config.toml"
+      OMNIPAXOS_SERVER_ADDRESS: "s1:8000"
     volumes:
-      - "C:/Users/Abdul Rahman/Desktop/DS-Project Ours/DS-Project/build_scripts/client-test-config.toml:/app/client-test-config.toml" # Mount correctly
+      - "C:/Users/Abdul Rahman/Desktop/DS-Project Ours/DS-Project/build_scripts/client-test-config.toml:/app/client-test-config.toml"
       - ./logs/:/app/logs/
     depends_on:
       - s1
@@ -92,9 +92,9 @@ services:
       RUST_LOG: "debug"
       CONFIG_FILE: "/app/client-test-config.toml"
       OMNIPAXOS_SERVER_ADDRESS: "s1:8000"
-      TEST_MODE: "linearizable-read" # Custom env for triggering linearizable read test
+      TEST_MODE: "linearizable-read"
     volumes:
-      - "C:/Users/Abdul Rahman/Desktop/DS-Project Ours/DS-Project/build_scripts/client-test-config.toml:/app/client-test-config.toml" # Ensure correct mounting path
+      - "C:/Users/Abdul Rahman/Desktop/DS-Project Ours/DS-Project/build_scripts/client-test-config.toml:/app/client-test-config.toml"
       - ./logs/:/app/logs/
     depends_on:
       - s1
@@ -132,7 +132,7 @@ services:
     container_name: stress_test_client
     environment:
       RUST_LOG: "debug"
-      CONFIG_FILE: "/app/client-test-config.toml" # This must match the mounted file name
+      CONFIG_FILE: "/app/client-test-config.toml"
       OMNIPAXOS_SERVER_ADDRESS: "s1:8000"
       TEST_MODE: "concurrent-load"
     volumes:

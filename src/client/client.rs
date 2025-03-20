@@ -81,23 +81,18 @@ impl Client {
                 }
                 _ = request_interval.tick(), if self.final_request_count.is_none() => {
                     let is_write = rng.gen::<f64>() > read_ratio;
-                    if self.next_request_id % 10 == 0 {
-                        // Every 10th request, use SQL instead of KV
-                        if is_write {
-                            // SQL write
-                            self.send_sql_demo_write().await;
-                        } else {
-                            // SQL read with different consistency levels
-                            let consistency = match self.next_request_id % 3 {
-                                0 => ReadConsistency::Leader,
-                                1 => ReadConsistency::Local,
-                                _ => ReadConsistency::Linearizable,
-                            };
-                            self.send_sql_demo_read(consistency).await;
-                        }
+                    // Modified to use SQL operations exclusively
+                    if is_write {
+                        // SQL write
+                        self.send_sql_demo_write().await;
                     } else {
-                        // Use regular KV operations for most requests
-                        self.send_regular_request(is_write).await;
+                        // SQL read with different consistency levels
+                        let consistency = match self.next_request_id % 3 {
+                            0 => ReadConsistency::Leader,
+                            1 => ReadConsistency::Local,
+                            _ => ReadConsistency::Linearizable,
+                        };
+                        self.send_sql_demo_read(consistency).await;
                     }
                 },
                 _ = next_interval.tick() => {
